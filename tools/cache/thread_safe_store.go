@@ -270,7 +270,12 @@ func (c *threadSafeMap) Replace(items map[string]interface{}, resourceVersion st
 	c.items = items
 
 	// rebuild any index
-	c.index.reset()
+	c.rebuildIndices()
+}
+
+// rebuildIndices rebuilds all indices for the current set c.items. Assumes that c.lock is held by caller
+func (c *threadSafeMap) rebuildIndices() {
+	c.indices = Indices{}
 	for key, item := range c.items {
 		c.index.updateIndices(nil, item, key)
 	}
@@ -339,11 +344,92 @@ func (c *threadSafeMap) AddIndexers(newIndexers Indexers) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if len(c.items) > 0 {
-		return fmt.Errorf("cannot add indexers to running index")
+	oldKeys := sets.StringKeySet(c.indexers)
+	newKeys := sets.StringKeySet(newIndexers)
+
+	if oldKeys.HasAny(newKeys.List()...) {
+		return fmt.Errorf("indexer conflict: %v", oldKeys.Intersection(newKeys))
 	}
 
-	return c.index.addIndexers(newIndexers)
+	for k, v := range newIndexers {
+		c.indexers[k] = v
+	}
+
+	if len(c.items) > 0 {
+		c.rebuildIndices()
+	}
+
+	return nil
+}
+
+// updateIndices modifies the objects location in the managed indexes:
+// - for create you must provide only the newObj
+// - for update you must provide both the oldObj and the newObj
+// - for delete you must provide only the oldObj
+// updateIndices must be called from a function that already has a lock on the cache
+func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, key string) {
+	var oldIndexValues, indexValues []string
+	var err error
+	for name, indexFunc := range c.indexers {
+		if oldObj != nil {
+			oldIndexValues, err = indexFunc(oldObj)
+		} else {
+			oldIndexValues = oldIndexValues[:0]
+		}
+		if err != nil {
+			panic(fmt.Errorf("unable to calculate an index entry for key %q on index %q: %v", key, name, err))
+		}
+
+		if newObj != nil {
+			indexValues, err = indexFunc(newObj)
+		} else {
+			indexValues = indexValues[:0]
+		}
+		if err != nil {
+			panic(fmt.Errorf("unable to calculate an index entry for key %q on index %q: %v", key, name, err))
+		}
+
+		index := c.indices[name]
+		if index == nil {
+			index = Index{}
+			c.indices[name] = index
+		}
+
+		if len(indexValues) == 1 && len(oldIndexValues) == 1 && indexValues[0] == oldIndexValues[0] {
+			// We optimize for the most common case where indexFunc returns a single value which has not been changed
+			continue
+		}
+
+		for _, value := range oldIndexValues {
+			c.deleteKeyFromIndex(key, value, index)
+		}
+		for _, value := range indexValues {
+			c.addKeyToIndex(key, value, index)
+		}
+	}
+}
+
+func (c *threadSafeMap) addKeyToIndex(key, indexValue string, index Index) {
+	set := index[indexValue]
+	if set == nil {
+		set = sets.String{}
+		index[indexValue] = set
+	}
+	set.Insert(key)
+}
+
+func (c *threadSafeMap) deleteKeyFromIndex(key, indexValue string, index Index) {
+	set := index[indexValue]
+	if set == nil {
+		return
+	}
+	set.Delete(key)
+	// If we don't delete the set when zero, indices with high cardinality
+	// short lived resources can cause memory to increase over time from
+	// unused empty sets. See `kubernetes/kubernetes/issues/84959`.
+	if len(set) == 0 {
+		delete(index, indexValue)
+	}
 }
 
 func (c *threadSafeMap) Resync() error {
