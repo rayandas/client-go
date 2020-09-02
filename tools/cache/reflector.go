@@ -858,7 +858,7 @@ func isTooLargeResourceVersionError(err error) bool {
 	if apierrors.HasStatusCause(err, metav1.CauseTypeResourceVersionTooLarge) {
 		return true
 	}
-	// In Kubernetes 1.17.0-1.18.5, the api server doesn't set the error status cause to
+	// In Kubernetes 1.15.0-1.18.5, the api server doesn't set the error status cause to
 	// metav1.CauseTypeResourceVersionTooLarge to indicate that the requested minimum resource
 	// version is larger than the largest currently available resource version. To ensure backward
 	// compatibility with these server versions we also need to detect the error based on the content
@@ -867,34 +867,17 @@ func isTooLargeResourceVersionError(err error) bool {
 		return false
 	}
 	apierr, ok := err.(apierrors.APIStatus)
-	if !ok || apierr == nil || apierr.Status().Details == nil {
+	if !ok || apierr == nil {
 		return false
 	}
-	for _, cause := range apierr.Status().Details.Causes {
-		// Matches the message returned by api server 1.17.0-1.18.5 for this error condition
-		if cause.Message == "Too large resource version" {
-			return true
+	if apierr.Status().Details != nil {
+		for _, cause := range apierr.Status().Details.Causes {
+			// Matches the message returned by api server 1.17.0-1.18.5 for this error condition
+			if cause.Message == "Too large resource version" {
+				return true
+			}
 		}
 	}
-
-	// Matches the message returned by api server before 1.17.0
-	if strings.Contains(apierr.Status().Message, "Too large resource version") {
-		return true
-	}
-
-	return false
-}
-
-// isWatchErrorRetriable determines if it is safe to retry
-// a watch error retrieved from the server.
-func isWatchErrorRetriable(err error) bool {
-	// If this is "connection refused" error, it means that most likely apiserver is not responsive.
-	// It doesn't make sense to re-list all objects because most likely we will be able to restart
-	// watch where we ended.
-	// If that's the case begin exponentially backing off and resend watch request.
-	// Do the same for "429" errors.
-	if utilnet.IsConnectionRefused(err) || apierrors.IsTooManyRequests(err) {
-		return true
-	}
-	return false
+	// 1.15.0-1.16.999 only set the status message
+	return strings.Contains(apierr.Status().Message, "Too large resource version")
 }
